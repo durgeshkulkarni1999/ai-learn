@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_groq import ChatGroq
@@ -8,43 +8,77 @@ from langchain_community.vectorstores import InMemoryVectorStore
 from langchain.tools import tool
 from langchain.agents import create_agent
 from langgraph.checkpoint.memory import InMemorySaver
+import streamlit as st
 
-loader = PyPDFLoader("../data/medical_report.pdf")
-docs = loader.load()
-splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-docs = splitter.split_documents(docs)
+if "document_uploaded" not in st.session_state:
+    st.session_state.document_uploaded = False
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-vector_db = InMemoryVectorStore.from_documents(documents=docs, embedding=embeddings)
+if "agent" not in st.session_state:
+    st.session_state.agent = None
 
-llm = ChatGroq(model = 'openai/gpt-oss-20b')
-@tool
-def retrieve_context(query: str):
-    """Retrieve documents relevant to the query from the knowledge base."""
-    context = ""
-    docs = vector_db.similarity_search(query=query,k=3)
-    for doc in docs:
-        context = doc.page_content + "\n\n"
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
 
-    return context
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-system_prompt = """You are a helpful assistant that answers questions using retrieved context. 
-        My knowledge base consists of the details from the uploaded document. 
-        ALWAYS use the `retrieve_context` tool for questions requiring external knowledge."""
+def process_document(path):
+    loader = PyPDFDirectoryLoader(path)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs = splitter.split_documents(docs)
 
-memory = InMemorySaver()
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    vector_db = InMemoryVectorStore.from_documents(documents=docs, embedding=embeddings)
 
-agent = create_agent(
-    model=llm,
-    tools=[retrieve_context],
-    system_prompt=system_prompt,
-    checkpointer=memory
-)
+    llm = ChatGroq(model = 'openai/gpt-oss-20b')
+    @tool
+    def retrieve_context(query: str):
+        """Retrieve documents relevant to the query from the knowledge base."""
+        context = ""
+        docs = vector_db.similarity_search(query=query,k=3)
+        for doc in docs:
+            context = doc.page_content + "\n\n"
 
-while True:
-    query = input("User: ")
-    if query.lower() in ["exit", "quit"]:
-        break
-    response = agent.invoke({"messages": [{"role": "user", "content": query}]},{"configurable":{"thread_id": 1}})
-    result = response["messages"][-1].content
-    print("AI: ", result)
+        return context
+
+    system_prompt = """You are a helpful assistant that answers questions using retrieved context. 
+            My knowledge base consists of the details from the uploaded document. 
+            ALWAYS use the `retrieve_context` tool for questions requiring external knowledge."""
+
+    memory = InMemorySaver()
+
+    agent = create_agent(
+        model=llm,
+        tools=[retrieve_context],
+        system_prompt=system_prompt,
+        checkpointer=memory
+    )
+
+    st.session_state.agent = agent
+    st.session_state.document_uploaded = True
+
+if not st.session_state.document_uploaded:
+    uploaded = st.file_uploader(label="Select PDF Files", type=["pdf"],accept_multiple_files=True)
+    if uploaded:
+        with st.spinner("Processing uploaded files..."):
+            path = "./doc_files/"
+            for file in uploaded:
+                with open(path + file.name, "wb") as f:
+                    f.write(file.getvalue())
+            process_document(path)
+            st.rerun()
+
+if st.session_state.document_uploaded and st.session_state.agent:
+    for message in st.session_state.messages:
+        role = message["role"]
+        content = message["content"]
+        st.chat_message(role).markdown(content)
+    query = st.chat_input("Ask a question about the uploaded documents:")
+    if query:
+        st.session_state.messages.append({"role": "user", "content": query})
+        st.chat_message("user").markdown(query)
+        response = st.session_state.agent.invoke({"messages": [{"role": "user", "content": query}]},{"configurable": {"thread_id": 1}})
+        answer = response["messages"][-1].content
+        st.session_state.messages.append({"role": "AI", "content": answer})
+        st.chat_message("AI").markdown(answer)
